@@ -1,0 +1,4 @@
+[
+  {"id": "example-created", "version": 1, "payload": {"state": "created", "email": "driver@example.invalid"}},
+  {"id": "example-updated", "version": 2, "payload": {"state": "updated", "email": "driver@example.invalid"}}
+]

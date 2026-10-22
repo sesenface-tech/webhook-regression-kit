@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "webhook-regression-kit"
+version = "0.1.0"
+description = "Generate reviewable webhook regression tests from local JSON fixtures"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Serkan Esen"}]
+dependencies = []
+
+[project.scripts]
+webhook-regression-kit = "webhook_regression_kit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["webhook_regression_kit*"]

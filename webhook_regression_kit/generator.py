@@ -1,0 +1,135 @@
+"""Deterministic test generation; no network or LLM calls."""
+
+import json
+import math
+import re
+
+SENSITIVE_KEYS = frozenset((
+    "password", "passwd", "passphrase", "token", "accesstoken", "refreshtoken",
+    "authorization", "auth", "apikey", "secret", "clientsecret", "cookie",
+    "setcookie", "email", "phone", "phonenumber", "address", "location",
+    "latitude", "longitude", "ipaddress", "vin", "licenseplate",
+))
+PATTERNS = (
+    re.compile(r"-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"\b(?:ghp_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|AKIA[A-Z0-9]{16})\b"),
+    re.compile(r"\b[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+)
+SCENARIOS = ("normal", "duplicate", "delayed", "reorder")
+
+
+def normalize(key):
+    return re.sub(r"[^a-z0-9]", "", key.lower())
+
+
+class Redactor:
+    """Best-effort patterns, NOT complete anonymization or a secret scanner."""
+
+    def __init__(self, explicit=()):
+        if any(not isinstance(v, str) or not v for v in explicit):
+            raise ValueError("Explicit redaction values must be non-empty strings")
+        self.explicit = sorted(set(explicit), key=lambda v: (-len(v), v))
+        self.replacements = {}
+        self.count = 0
+
+    def placeholder(self, value):
+        # The map stays in memory and is never included in generated artifacts.
+        canonical = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
+        if canonical not in self.replacements:
+            self.replacements[canonical] = f"REDACTED_{len(self.replacements) + 1:04d}"
+        self.count += 1
+        return self.replacements[canonical]
+
+    def text(self, value):
+        for item in self.explicit:
+            if item in value:
+                value = value.replace(item, self.placeholder(item))
+        # URLs are removed wholesale; credentials and query strings can hide in them.
+        value = re.sub(r"https?://[^\s\"'<>]+", lambda m: self.placeholder(m.group()), value)
+        for pattern in PATTERNS:
+            value = pattern.sub(lambda m: self.placeholder(m.group()), value)
+        return value
+
+    def clean(self, value):
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                new_key = self.text(key)
+                if new_key in result:
+                    raise ValueError("Redaction caused a key collision")
+                result[new_key] = self.placeholder(item) if normalize(key) in SENSITIVE_KEYS else self.clean(item)
+            return result
+        if isinstance(value, list):
+            return [self.clean(v) for v in value]
+        if isinstance(value, str):
+            return self.text(value)
+        return value
+
+
+def validate(events, expected, scenario, delay, wait):
+    if scenario not in SCENARIOS:
+        raise ValueError("Unsupported scenario")
+    if not isinstance(events, list) or not 1 <= len(events) <= 100:
+        raise ValueError("Events must be an array of 1..100 objects")
+    if scenario != "normal" and len(events) < 2:
+        raise ValueError("Fault scenarios need at least two events")
+    if not isinstance(expected, dict) or not expected:
+        raise ValueError("Expected receiver state must be a non-empty object")
+    seen = set()
+    for event in events:
+        if not isinstance(event, dict):
+            raise ValueError("Each event must be an object")
+        event_id = event.get("id")
+        if not isinstance(event_id, str) or not 1 <= len(event_id) <= 128 or not all(32 <= ord(c) <= 126 for c in event_id):
+            raise ValueError("Each id must be 1..128 printable ASCII characters")
+        if event_id in seen:
+            raise ValueError("Source event IDs must be unique")
+        seen.add(event_id)
+        if len(json.dumps(event, ensure_ascii=False, allow_nan=False).encode()) > 65536:
+            raise ValueError("Event exceeds 64 KiB")
+    for value in (delay, wait):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 5:
+            raise ValueError("Timing must be between 0 and 5 seconds")
+    json.dumps(expected, allow_nan=False)
+
+
+def generate(events, expected, scenario="duplicate", delay=0.1, wait=0, explicit=()):
+    validate(events, expected, scenario, delay, wait)
+    redactor = Redactor(explicit)
+    clean_events = redactor.clean(events)
+    clean_expected = redactor.clean(expected)
+    # Re-check in case redaction changed structural requirements, e.g. event IDs.
+    validate(clean_events, clean_expected, scenario, delay, wait)
+    case = {"events": clean_events, "expected": clean_expected,
+            "scenario": scenario, "delay": delay, "wait": wait}
+    encoded = repr(json.dumps(case, ensure_ascii=True, allow_nan=False, sort_keys=True))
+    source = '''# Generated by webhook-regression-kit 0.1.0. Review redacted fixtures before sharing.
+# Local testing only. Requires delivery-probe 0.1.x on PYTHONPATH or installed.
+import json
+import os
+import unittest
+
+from delivery_probe.core import run
+
+CASE = json.loads(''' + encoded + ''')
+
+
+class WebhookRegression(unittest.TestCase):
+    def test_receiver_state(self):
+        target = os.environ.get("WEBHOOK_TARGET")
+        state_url = os.environ.get("WEBHOOK_STATE_URL")
+        if not target or not state_url:
+            self.fail("Set WEBHOOK_TARGET and WEBHOOK_STATE_URL to isolated loopback test endpoints")
+        report = run(CASE["events"], target, scenario=CASE["scenario"],
+                     delay=CASE["delay"], wait=CASE["wait"],
+                     state_url=state_url, expected=CASE["expected"])
+        self.assertEqual(report["outcome"], "verified", json.dumps(report, sort_keys=True))
+
+
+if __name__ == "__main__":
+    unittest.main()
+'''
+    return source, {"redaction_occurrences": redactor.count, "event_count": len(events),
+                    "scenario": scenario, "manual_review_required": True}
